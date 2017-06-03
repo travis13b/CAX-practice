@@ -1,0 +1,474 @@
+setwd("E:\\MR\\CAX1")
+train=read.csv("CAX_Startup_Train.csv",header=TRUE,as.is=T)
+test=read.csv("CAX_Startup_Test.csv",header=TRUE,as.is=T)
+#dict=read.csv("CAX_Startup_DataDictionary.csv")
+d=rbind(train,test)
+
+#converting character to factor
+for(i in c(4,6,12,14,16,17,20,39,43,44,45,48,51)){
+   d[[i]]=factor(d[[i]])
+   }
+
+library(plyr)
+d$Founders_previous_company_employee_count=as.numeric(revalue(d$Founders_previous_company_employee_count,
+                                         c("Small"=1,"Medium"=2,"Large"=3)))								 
+  
+d$Founders_Industry_exposure=as.numeric(revalue(d$Founders_Industry_exposure,
+                                               c("Low"=1,"Medium"=2,"High"=3)))
+d$Founders_profile_similarity=as.numeric(revalue(d$Founders_profile_similarity,
+                                               c("None"=0,"Low"=1,"Medium"=2,"High"=3)))
+table(d$Founders_publications)											   
+d$Founders_publications=as.numeric(revalue(d$Founders_publications,
+                                               c("None"=1,"Few"=2,"Many"=3)))
+table(d$Company_difficulty_obtaining_workforce)
+d$Company_difficulty_obtaining_workforce=as.numeric(revalue(d$Company_difficulty_obtaining_workforce,
+                                               c("Low"=1,"Medium"=2,"High"=3)))
+d$Founders_experience=as.numeric(revalue(d$Founders_experience,
+                                               c("Low"=1,"Medium"=2,"High"=3)))											   
+table(d$Company_Industry_count)
+d$Company_Industry_count=as.numeric(revalue(d$Company_Industry_count,
+                                               c("single"=1,"Few"=2,"Many"=3)))		
+table(d$Founder_education)
+d$Founder_education=factor(d$Founder_education)
+d$Company_Product_or_service=factor(d$Company_Product_or_service)
+d$Company_business_model=factor(d$Company_business_model)
+d$Founder_highest_degree_type=factor(d$Founder_highest_degree_type)
+table(d$Company_raising_fund)
+d$Company_Location=factor(d$Company_Location)
+
+
+
+###################### caret #########################################
+d1=train
+d1$Dependent=as.numeric(d1$Dependent)
+d1$CAX_ID=NULL
+library(caret)
+#one hot encoding
+dmy=dummyVars("~.",data=d1,fullRank=T)
+d_transformed=data.frame(predict(dmy,newdata=d1))
+d_transformed$Dependent=as.factor(d_transformed$Dependent)
+dmy2=dummyVars("~.",data=test[,3:51],fullRank=T)
+testSet=data.frame(predict(dmy2,newdata=test[,3:51]))
+
+#feature selection
+control=rfeControl(functions=rfFuncs,method="repeatedcv",repeats=3,verbose=FALSE)
+Loan_pred_profile=rfe(d_transformed[,2:64],d_transformed[,1],rfeControl=control)
+Loan_pred_profile
+#taking top 5
+predictors=c("Company_business_modelB2C", "Company_senior_team_count", "Company_repeat_investors_count",
+                      "Company_competitor_count","Company_avg_investment_time")
+model_rf=train(d_transformed[,predictors],d_transformed[,1],method="rf")	
+predictions=predict.train(object=model_rf,testSet[,predictors],type="raw")	
+predictions=as.numeric(predictions)	
+submit_CAX=cbind(test$CAX_ID,predictions-1)
+colnames(submit_CAX)=c("CAX_ID","Dependent")
+write.csv(submit_CAX,"Predictions.csv",row.names=F)		  
+############################# caret ######################################
+
+#partition train and test set 
+#seperate out 0 and 1 level
+train_0=train[train$Dependent==0,]
+train_1=train[train$Dependent==1,]
+train_0$Category=NULL
+train_1$Category=NULL
+
+#randomly choosing test and train set for each level
+library(caTools)
+sample_0=sample.split(train_0,SplitRatio=.9)
+train_0_new=subset(train_0,sample_0==TRUE)
+test_0_new=subset(train_0,sample_0==FALSE)
+
+sample_1=sample.split(train_1,SplitRatio=.9)
+train_1_new=subset(train_1,sample_1==TRUE)
+test_1_new=subset(train_1,sample_1==FALSE)
+
+#final new train test
+train_new=rbind(train_1_new,train_0_new)
+test_new=rbind(test_1_new,test_0_new)
+
+#variable selection using information value
+library(devtools)
+library(woe)
+library(tcltk)
+
+train_new$CAX_ID=NULL
+#calculation of information value
+row.names(train_new)=seq(1,nrow(train_new))
+IV=iv.mult(train_new,y="Dependent",TRUE)
+
+#selecting variable with 0.1< IV <0.5
+var=IV[which(IV$informationValue>0.1),]
+var1=var[which(var$informationValue<0.5),]
+final_var=var1$Variable
+
+x_train=train_new[final_var]
+Dependent=train_new$Dependent
+train_final=cbind(Dependent,x_train)
+
+######################## Model Building #########################
+#fitting stepwise binary logistic regression with logit link function
+mod=step(glm(Dependent~.,family=binomial(link=logit),data=train_final))
+summary(mod)	
+
+model<-glm(formula = Dependent ~ Company_competitor_count +
+Company_1st_investment_time + Founders_Data_Science_skills_score +
+Company_big_data + Founders_publications + Founders_global_exposure,
+family = binomial(link = logit), data = train_final)
+summary(model)
+
+#odds ratio and 95% CI
+exp(cbind(OR=coef(model),confint(model)))
+
+#model fit Hosmer and Lemeshow goodness of fit test 
+library(ResourceSelection)
+hoslem.test(train_new$Dependent,model$fitted.values,g=10)
+
+########################## prediction test score and model evaluation ##################
+pred_prob=predict(model,newdata=test_new,type="response")
+
+#model accuray measure
+library(ROCR)
+pred=prediction(pred_prob,test_new$Dependent)
+# area under the curve
+Performance(pred,'auc')
+
+#creating ROC curve
+roc=performance(pred,"tpr","fpr")
+plot(roc)
+#create data frame of values
+perf=as.data.frame(cbind(roc@alpha.values[[1]],roc@x.values[[1]],roc@y.values[[1]]))
+colnames(perf)=c("Probability","FPR","TPR")
+
+#removing infinity value from data frame
+perf=perf[-1,]
+
+#reshape the data frame
+library(reshape)
+perf2=melt(perf,measure.vars=c("FPR","TPR"))
+#ploting FPR,TPR on y axis and cut off probability on x axis
+library(ggplot2)
+ggplot(perf2,aes(Probability,value,colour=variable))+geom_line()+theme_bw()
+
+#model accuracy confusion matrix
+library(SDMTools)
+confusion.matrix(test_new$Dependent,pred_prob,threshold=0.42)
+
+# prediction on test set of CAX
+pred_CAX=predict(model,newdata=test,type="response")
+submit_CAX=cbind(test$CAX_ID,pred_CAX)
+colnames(submit_CAX)=c("CAX_ID","Dependent")
+write.csv(submit_CAX,"Predictions.csv",row.names=F)
+
+################################################################################
+#############################feature eng########################################
+library(ggplot2)
+ggplot(d,aes(x=(d$Company_investor_count_seed)^(1/3)))+geom_bar()
+d$New_Company_investor_count_seed=(d$Company_investor_count_seed)^(1/3)
+#d$New_Company_investor_count_seed[d$Company_investor_count_seed>=3]="High"
+#d$New_Company_investor_count_seed[d$Company_investor_count_seed<3 & d$Company_investor_count_seed>0]="Medium"
+#d$New_Company_investor_count_seed[d$Company_investor_count_seed==0]="Zero"
+#d$New_Company_investor_count_seed=factor(d$New_Company_investor_count_seed)
+
+ggplot(d,aes(x=(d$Company_investor_count_Angel_VC)^(1)))+geom_bar()
+#d$New_Company_investor_count_Angel_VC[d$Company_investor_count_Angel_VC>=2.5]="High"
+#d$New_Company_investor_count_Angel_VC[d$Company_investor_count_Angel_VC<2.5 & d$Company_investor_count_Angel_VC>0]="Medium"
+#d$New_Company_investor_count_Angel_VC[d$Company_investor_count_Angel_VC==0]="Zero"
+#d$New_Company_investor_count_Angel_VC=factor(d$New_Company_investor_count_Angel_VC)
+
+ggplot(d,aes(x=(d$Company_cofounders_count)^(1)))+geom_bar()
+#d$New_Company_cofounders_count[d$Company_cofounders_count==2]="Two"
+#d$New_Company_cofounders_count[d$Company_cofounders_coun>2]="Two+"
+#d$New_Company_cofounders_count[d$Company_cofounders_count<2]="Two-"
+#d$New_Company_cofounders_count=factor(d$New_Company_cofounders_count)
+
+ggplot(d,aes(x=(d$Company_advisors_count)^(1/2)))+geom_bar()
+d$New_Company_advisors_count=(d$Company_advisors_count)^(0.5)
+#d$New_Company_advisors_count[d$Company_advisors_count==0]="Zero"
+#d$New_Company_advisors_count[d$Company_advisors_count>0 & d$Company_advisors_count<3]="Medium"
+#d$New_Company_advisors_count[d$Company_advisors_count>=3]="High"
+#d$New_Company_advisors_count=factor(d$New_Company_advisors_count)
+
+ggplot(d,aes(x=(d$Company_senior_team_count)^(1)))+geom_bar()
+#d$New_Company_senior_team_count[d$Company_senior_team_count<3]="Small"
+#d$New_Company_senior_team_count[d$Company_senior_team_count>=3 & d$Company_senior_team_count<6]="Medium"
+#d$New_Company_senior_team_count[d$Company_senior_team_count>=6]="Large"
+#d$New_Company_senior_team_count=factor(d$New_Company_senior_team_count)
+
+ggplot(d,aes(x=(d$New_Company_repeat_investors_count)))+geom_bar()
+d$New_Company_repeat_investors_count[d$Company_repeat_investors_count==0]="No"
+d$New_Company_repeat_investors_count[d$Company_repeat_investors_count>0]="Yes"
+d$New_Company_repeat_investors_count=factor(d$New_Company_repeat_investors_count)
+
+ggplot(d,aes(x=(d$Founders_experience)))+geom_bar()
+d$New_Founders_experience[d$Founders_experience<3]="Less"
+d$New_Founders_experience[d$Founders_experience==3]="More"
+d$New_Founders_experience=factor(d$New_Founders_experience)
+
+ggplot(d,aes(x=(d$Founders_fortune1000_company_score)))+geom_bar()
+d$New_Founders_fortune1000_company_score[d$Founders_fortune1000_company_score==0]="Zero"
+d$New_Founders_fortune1000_company_score[d$Founders_fortune1000_company_score>0 & d$Founders_fortune1000_company_score<=0.5]="Avg"
+d$New_Founders_fortune1000_company_score[d$Founders_fortune1000_company_score>0.5]="High"
+d$New_Founders_fortune1000_company_score=factor(d$New_Founders_fortune1000_company_score)
+
+ggplot(d,aes(x=(d$Founders_skills_score)))+geom_bar()
+d$New_Founders_skills_score[d$Founders_skills_score<=10]="Low"
+d$New_Founders_skills_score[d$Founders_skills_score>10 & d$Founders_skills_score<20]="Avg"
+d$New_Founders_skills_score[d$Founders_skills_score>=20 & d$Founders_skills_score<35]="AbvAvg"
+d$New_Founders_skills_score[d$Founders_skills_score>=35]="High"
+d$New_Founders_skills_score=factor(d$New_Founders_skills_score)
+
+ggplot(d,aes(x=(d$New_Founders_Entrepreneurship_skills_score)))+geom_bar()
+d$New_Founders_Entrepreneurship_skills_score[d$Founders_Entrepreneurship_skills_score==0]="Zero"
+d$New_Founders_Entrepreneurship_skills_score[d$Founders_Entrepreneurship_skills_score>0 &
+                                             d$Founders_Entrepreneurship_skills_score<10]="Avg"
+d$New_Founders_Entrepreneurship_skills_score[d$Founders_Entrepreneurship_skills_score>=10]="High"
+d$New_Founders_Entrepreneurship_skills_score=factor(d$New_Founders_Entrepreneurship_skills_score)
+
+ggplot(d,aes(x=(d$Founders_Operations_skills_score)))+geom_bar()
+#d$New_Founders_Operations_skills_score[d$Founders_Operations_skills_score==0]="Zero"
+#d$New_Founders_Operations_skills_score[d$Founders_Operations_skills_score>0 &
+#                                            d$Founders_Operations_skills_score<7]="Avg"
+#d$New_Founders_Operations_skills_score[d$Founders_Operations_skills_score>=7]="High"
+#d$New_Founders_Operations_skills_score=factor(d$New_Founders_Operations_skills_score)
+
+#d$New_Founders_Engineering_skills_score[d$Founders_Engineering_skills_score==0]="Zero"
+#d$New_Founders_Engineering_skills_score[d$Founders_Engineering_skills_score>0 &
+#                                             d$Founders_Engineering_skills_score<25]="Avg"
+#d$New_Founders_Engineering_skills_score[d$Founders_Engineering_skills_score>=25]="High"
+#d$New_Founders_Engineering_skills_score=factor(d$New_Founders_Engineering_skills_score)
+
+d$New_Founders_Marketing_skills_score[d$Founders_Marketing_skills_score==0]="Zero"
+d$New_Founders_Marketing_skills_score[d$Founders_Marketing_skills_score>0 &
+                                             d$Founders_Marketing_skills_score<10]="Avg"
+d$New_Founders_Marketing_skills_score[d$Founders_Marketing_skills_score>=10]="High"
+d$New_Founders_Marketing_skills_score=factor(d$New_Founders_Marketing_skills_score)
+
+d$New_Founders_Leadership_skills_score[d$Founders_Leadership_skills_score==0]="Zero"
+d$New_Founders_Leadership_skills_score[d$Founders_Leadership_skills_score>0 &
+                                             d$Founders_Leadership_skills_score<10]="Avg"
+d$New_Founders_Leadership_skills_score[d$Founders_Leadership_skills_score>=10]="High"
+d$New_Founders_Leadership_skills_score=factor(d$New_Founders_Leadership_skills_score)
+
+d$New_Founders_Data_Science_skills_score[d$Founders_Data_Science_skills_score==0]="Zero"
+d$New_Founders_Data_Science_skills_score[d$Founders_Data_Science_skills_score>0 &
+                                             d$Founders_Data_Science_skills_score<10]="Avg"
+d$New_Founders_Data_Science_skills_score[d$Founders_Data_Science_skills_score>=10]="High"
+d$New_Founders_Data_Science_skills_score=factor(d$New_Founders_Data_Science_skills_score)
+
+d$New_Founders_Business_Strategy_skills_score[d$Founders_Business_Strategy_skills_score==0]="Zero"
+d$New_Founders_Business_Strategy_skills_score[d$Founders_Business_Strategy_skills_score>0 &
+                                             d$Founders_Business_Strategy_skills_score<10]="Avg"
+d$New_Founders_Business_Strategy_skills_score[d$Founders_Business_Strategy_skills_score>=10]="High"
+d$New_Founders_Business_Strategy_skills_score=factor(d$New_Founders_Business_Strategy_skills_score)
+
+d$New_Founders_Product_Management_skills_score[d$Founders_Product_Management_skills_score==0]="Zero"
+d$New_Founders_Product_Management_skills_score[d$Founders_Product_Management_skills_score>0 &
+                                             d$Founders_Product_Management_skills_score<10]="Avg"
+d$New_Founders_Product_Management_skills_score[d$Founders_Product_Management_skills_score>=10]="High"
+d$New_Founders_Product_Management_skills_score=factor(d$New_Founders_Product_Management_skills_score)
+
+d$New_Founders_Sales_skills_score[d$Founders_Sales_skills_score==0]="Zero"
+d$New_Founders_Sales_skills_score[d$Founders_Sales_skills_score>0 &
+                                             d$Founders_Sales_skills_score<10]="Avg"
+d$New_Founders_Sales_skills_score[d$Founders_Sales_skills_score>=10]="High"
+d$New_Founders_Sales_skills_score=factor(d$New_Founders_Sales_skills_score)
+
+d$New_Founders_Domain_skills_score[d$Founders_Domain_skills_score==0]="Zero"
+d$New_Founders_Domain_skills_score[d$Founders_Domain_skills_score>0 &
+                                             d$Founders_Domain_skills_score<10]="Avg"
+d$New_Founders_Domain_skills_score[d$Founders_Domain_skills_score>=10]="High"
+d$New_Founders_Domain_skills_score=factor(d$New_Founders_Domain_skills_score)
+
+
+
+d$New_Company_competitor_count[d$Company_competitor_count==0]="Zero"
+d$New_Company_competitor_count[d$Company_competitor_count>0 & d$Company_competitor_count<7]="Medium"
+d$New_Company_competitor_count[d$Company_competitor_count>=7]="High"
+d$New_Company_competitor_count=factor(d$New_Company_competitor_count)
+
+ggplot(d,aes(x=(d$Company_1st_investment_time)))+geom_bar()
+#d$New_Company_1st_investment_time[d$Company_1st_investment_time==0]="Low"
+#d$New_Company_1st_investment_time[d$Company_1st_investment_time>0 & d$Company_1st_investment_time<20]="Medium"
+#d$New_Company_1st_investment_time[d$Company_1st_investment_time>=20]="High"
+#d$New_Company_1st_investment_time=factor(d$New_Company_1st_investment_time)
+
+ggplot(d,aes(x=(d$Company_avg_investment_time)^(1/2)))+geom_bar()
+#d$New_Company_avg_investment_time[d$Company_avg_investment_time>0 & d$Company_avg_investment_time<8]="Medium"
+#d$New_Company_avg_investment_time[d$Company_avg_investment_time>=8]="High"
+#d$New_Company_avg_investment_time=factor(d$New_Company_avg_investment_time)
+
+library(caret)
+pre=preProcess(d[,29:38],method=c("center","scale"))
+newCol=predict(pre,d[,29:38])
+newCol$Sum=rowSums(newCol)
+
+###################### model rf ################################################
+#train_new=subset(d[,1:51],is.na(d$Dependent)==FALSE)
+#test_new=subset(d[,1:51],is.na(d$Dependent)==TRUE)
+#train_new=subset(d[,-c(7,8,9,10,11,13,19,25,28:38,40,41,42)],is.na(d$Dependent)==FALSE)
+#test_new=subset(d[,-c(7,8,9,10,11,13,19,25,28:38,40,41,42)],is.na(d$Dependent)==TRUE)
+d$New_Skills=newCol$Sum
+
+train_new=subset(d[,-c(7,10,13,21,27,30,31,42)],is.na(d$Dependent)==FALSE)
+test_new=subset(d[,-c(7,10,13,21,27,30,31,42)],is.na(d$Dependent)==TRUE)
+train_ID=train_new$CAX_ID
+train_new$CAX_ID=NULL
+train_new$Dependent=factor(train_new$Dependent)
+test_ID=test_new$CAX_ID
+test_new$CAX_ID=NULL
+test_new$Dependent=NULL
+
+library(randomForest)
+model_rf2=randomForest(Dependent~.,data=train_new)
+importance(model_rf2)
+
+				 
+pred=predict(model_rf,newdata=test_new,type="response")								 
+pred=as.numeric(pred)-1
+
+pred1=predict(model_rf1,newdata=test_new,type="response")								 
+pred1=as.numeric(pred1)-1
+
+#library(e1071)
+#model_nb=naiveBayes(Dependent~.,data=train_new)						 
+#pred3=predict(model_nb,newdata=test_new)
+#pred3=as.numeric(pred3)-1
+
+pred2=predict(model_rf2,newdata=test_new,type="response") 
+pred2=as.numeric(pred2)-1
+
+pred4=predict(model_rf4,newdata=test_new,type="response") 
+pred4=as.numeric(pred4)-1
+
+###################ensemble#########################
+
+
+pred_avg=(pred1+pred2)/2
+pred_avg=ifelse(pred_avg>0.5,1,0)
+submit=cbind(test_ID,pred_avg)
+colnames(submit)=c("CAX_ID","Dependent")
+write.csv(submit,"ensemble0.csv",row.names=F)
+
+
+submit=cbind(test_ID,pred2)
+colnames(submit)=c("CAX_ID","Dependent")
+write.csv(submit,"temp.csv",row.names=F)
+
+
+#pred basic
+#pred1 7 new vars .719
+
+###################################################################################################
+################################# XGBoost #########################################################
+
+library(xgboost)
+library(readr)
+library(stringr)
+library(caret)
+library(car)
+
+#train
+
+ohe_features=c("Company_Location","Company_raising_fund","Company_mobile_app",
+                "Company_top_Angel_VC_funding",
+			     "Founders_top_company_experience",
+				   "Founders_startup_experience",
+				   "Founders_big_5_experience",
+				   "Company_business_model",
+				   "Founders_global_exposure",
+				   "Founder_education",
+				   "Company_incubation_investor",
+				   "Company_crowdsourcing",
+				   "Company_crowdfunding",
+				   "Company_big_data",
+				   "Company_Product_or_service",
+				   "Company_subscription_offering",
+				   "Founder_highest_degree_type",
+				   "Company_Founder_Patent",
+				   "New_Company_repeat_investors_count",
+				   "New_Founders_experience",
+				   "New_Founders_fortune1000_company_score",
+				   "New_Founders_skills_score",
+				   "New_Founders_Entrepreneurship_skills_score",
+				   "New_Company_competitor_count")
+dummies=dummyVars(~Company_Location+
+                   Company_raising_fund+
+				   Company_mobile_app+
+				   Company_top_Angel_VC_funding+
+				   Founders_top_company_experience+
+				   Founders_startup_experience+
+				   Founders_big_5_experience+
+				   Company_business_model+
+				   Founders_global_exposure+
+				   Founder_education+
+				   Company_incubation_investor+
+				   Company_crowdsourcing+
+				   Company_crowdfunding+
+				   Company_big_data+
+				   Company_Product_or_service+
+				   Company_subscription_offering+
+				   Founder_highest_degree_type+
+				   Company_Founder_Patent+
+				   New_Company_repeat_investors_count+
+				   New_Founders_experience+
+				   New_Founders_fortune1000_company_score+
+				   New_Founders_skills_score+
+				   New_Founders_Entrepreneurship_skills_score+
+				   New_Company_competitor_count,
+				   data=train_new)
+train_dummies=as.data.frame(predict(dummies,newdata=train_new))				   
+train_final=cbind(train_new[,-c(which(colnames(train_new) %in% ohe_features))],train_dummies)
+label=train_final$Dependent
+data=as.matrix(train_final[,-c(1,2)])
+xgmat=xgb.DMatrix(data,label=label,missing=-999)
+
+dummies=dummyVars(~Company_Location+
+                   Company_raising_fund+
+				   Company_mobile_app+
+				   Company_top_Angel_VC_funding+
+				   Founders_top_company_experience+
+				   Founders_startup_experience+
+				   Founders_big_5_experience+
+				   Company_business_model+
+				   Founders_global_exposure+
+				   Founder_education+
+				   Company_incubation_investor+
+				   Company_crowdsourcing+
+				   Company_crowdfunding+
+				   Company_big_data+
+				   Company_Product_or_service+
+				   Company_subscription_offering+
+				   Founder_highest_degree_type+
+				   Company_Founder_Patent+
+				   New_Company_repeat_investors_count+
+				   New_Founders_experience+
+				   New_Founders_fortune1000_company_score+
+				   New_Founders_skills_score+
+				   New_Founders_Entrepreneurship_skills_score+
+				   New_Company_competitor_count,
+				   data=test_new)
+test_dummies=as.data.frame(predict(dummies,newdata=test_new))				   
+test_final=cbind(test_new[,-c(which(colnames(test_new) %in% ohe_features))],test_dummies)
+label=as.numeric(train_final$Dependent)
+test_data=as.matrix(test_final[,-1])
+testxgb=xgb.DMatrix(test_data)
+
+
+xgb=xgboost(data=data.matrix(train_final[,-c(1,2)]), label = label, 
+           eta = 0.1,
+           max_depth = 15, 
+           nround=25, 
+           subsample = 0.5,
+           colsample_bytree = 0.5,
+           seed = 1,
+           eval_metric = "merror",
+           objective = "binary:logitraw",
+           num_class = 12,
+           nthread = 3
+)
+
+y_pred=predict(xgb,testxgb)
+xgb_pred=ifelse(y_pred>0.5,1,0)
+submit=cbind(test_ID,pred_avg)
+colnames(submit)=c("CAX_ID","Dependent")
+write.csv(submit,"ensemble0.csv",row.names=F)
